@@ -1,0 +1,930 @@
+-- LocalScript: Piggy Exploit-Style Replicator Hub (Dual-Layer Texture Placement - No Color Tinting on Textures)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Check HTTP Executor Capabilities
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
+
+-- Piggy Remotes
+local Functions = ReplicatedStorage:WaitForChild("Functions")
+local PlaceBlockRemote = Functions:WaitForChild("PlaceBlock")
+local CommitMoveRemote = Functions:WaitForChild("CommitMove")
+local CommitResizeRemote = Functions:WaitForChild("CommitResize")
+local UpdateBlockSettingsRemote = Functions:FindFirstChild("UpdateBlockSettings")
+local SaveBuildRemote = Functions:WaitForChild("SaveBuild")
+
+-- Block Templates Setup
+local BlocksFolder = ReplicatedStorage:WaitForChild("Blocks")
+local BasicBlocks = BlocksFolder:WaitForChild("Basic")
+local LightsFolder = BlocksFolder:FindFirstChild("Lights")
+local SpecialBlocksFolder = ReplicatedStorage:FindFirstChild("SpecialBlocks")
+
+-- Default Base Block Template
+local DefaultBlockTemplate = BasicBlocks:WaitForChild("Block"):WaitForChild("Block")
+
+-- Texture Block Template Path (via EventItems_ImageBlockBeta)
+local TextureBlockTemplate = nil
+if SpecialBlocksFolder and SpecialBlocksFolder:FindFirstChild("EventItems_ImageBlockBeta") then
+	local beta = SpecialBlocksFolder.EventItems_ImageBlockBeta
+	if beta:FindFirstChild("Links") and beta.Links:FindFirstChild("TextureBlock") then
+		TextureBlockTemplate = beta.Links.TextureBlock:FindFirstChild("TextureBlock")
+	end
+end
+
+-- Fallback Shape Templates
+local WindowBlockTemplate = BasicBlocks:FindFirstChild("WindowBlock") and BasicBlocks.WindowBlock:FindFirstChild("WindowBlock")
+local TransparentBlockTemplate = BasicBlocks:FindFirstChild("TransparentBlock") and BasicBlocks.TransparentBlock:FindFirstChild("TransparentBlock")
+local TransparentThinWallTemplate = BasicBlocks:FindFirstChild("TransparentThinWall") and BasicBlocks.TransparentThinWall:FindFirstChild("TransparentThinWall")
+
+-- Light Template
+local InvisibleLightTemplate = LightsFolder and LightsFolder:FindFirstChild("CustomInvisibleLightBlock") and LightsFolder.CustomInvisibleLightBlock:FindFirstChild("CustomInvisibleLightBlock")
+
+-- Global States
+local isRunning = false
+local autoSaveActive = false
+local currentRotationCF = CFrame.Angles(0, 0, 0)
+local currentSearchQuery = ""
+local currentPage = 1
+
+-- HELPER: LIGHT DETECTION
+local function findLightInPartOrAttachments(part)
+	local directLight = part:FindFirstChildOfClass("PointLight") or part:FindFirstChildOfClass("SurfaceLight") or part:FindFirstChildOfClass("SpotLight")
+	if directLight then return directLight end
+
+	for _, descendant in ipairs(part:GetDescendants()) do
+		if descendant:IsA("Attachment") then
+			local attachLight = descendant:FindFirstChildOfClass("PointLight") or descendant:FindFirstChildOfClass("SurfaceLight") or descendant:FindFirstChildOfClass("SpotLight")
+			if attachLight then return attachLight end
+		end
+	end
+	return nil
+end
+
+-- SHAPE TEMPLATE RESOLVER
+local function getTemplateForPart(part)
+	local name = string.lower(part.Name)
+	local className = part.ClassName
+
+	if part.Transparency > 0.05 or part.Material == Enum.Material.Glass then
+		if string.find(name, "thin") or string.find(name, "wall") then
+			if TransparentThinWallTemplate then return TransparentThinWallTemplate end
+		end
+		if string.find(name, "window") or string.find(name, "glass") then
+			if WindowBlockTemplate then return WindowBlockTemplate end
+		end
+		if TransparentBlockTemplate then return TransparentBlockTemplate end
+	end
+
+	if string.find(name, "tshape") or string.find(name, "thinwallt") then
+		if BasicBlocks:FindFirstChild("ThinWallTShape") then
+			return BasicBlocks.ThinWallTShape:FindFirstChild("ThinWallTShape")
+		end
+	elseif string.find(name, "corner") or string.find(name, "thinwallcorner") then
+		if BasicBlocks:FindFirstChild("ThinWallCorner") then
+			return BasicBlocks.ThinWallCorner:FindFirstChild("ThinWallCorner")
+		end
+	elseif className == "WedgePart" or string.find(name, "wedge") then
+		if BasicBlocks:FindFirstChild("Wedge") then
+			return BasicBlocks.Wedge:FindFirstChild("Wedge")
+		end
+	elseif className == "CylinderPart" or string.find(name, "cylinder") then
+		if BasicBlocks:FindFirstChild("Cylinder") then
+			return BasicBlocks.Cylinder:FindFirstChild("Cylinder")
+		end
+	elseif className == "Part" and part.Shape == Enum.PartType.Ball or string.find(name, "sphere") then
+		if BasicBlocks:FindFirstChild("Sphere ") then
+			return BasicBlocks["Sphere "]:FindFirstChild("Sphere ")
+		end
+	elseif string.find(name, "tooth") then
+		if BasicBlocks:FindFirstChild("ToothBlock") then
+			return BasicBlocks.ToothBlock:FindFirstChild("ToothBlock")
+		end
+	end
+
+	return DefaultBlockTemplate
+end
+
+-- CLEAN UP EXISTING GUI
+local oldGui = CoreGui:FindFirstChild("PiggyExploitHub") or LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("PiggyExploitHub")
+if oldGui then oldGui:Destroy() end
+
+-- MAIN GUI CONTAINER
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Fn"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 2000
+
+pcall(function() screenGui.Parent = CoreGui end)
+if not screenGui.Parent then screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+-- MAIN EXPLOIT FRAME
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 480, 0, 380)
+main.Position = UDim2.new(0.5, -240, 0.5, -190)
+main.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+main.BorderColor3 = Color3.fromRGB(45, 45, 45)
+main.BorderSizePixel = 1
+main.Active = true
+main.Parent = screenGui
+
+-- TOUCH / MOUSE DRAGGING
+local dragging, dragInput, dragStart, startPos
+local function update(input)
+	local delta = input.Position - dragStart
+	main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+main.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = main.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+main.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		dragInput = input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if input == dragInput and dragging then
+		update(input)
+	end
+end)
+
+-- TITLE BAR
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+titleBar.BorderColor3 = Color3.fromRGB(35, 35, 35)
+titleBar.BorderSizePixel = 1
+titleBar.Parent = main
+
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(1, -10, 1, 0)
+titleText.Position = UDim2.new(0, 10, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Text = "PIGGY REPLICATOR HUB"
+titleText.TextColor3 = Color3.fromRGB(200, 200, 200)
+titleText.Font = Enum.Font.Code
+titleText.TextSize = 12
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Parent = titleBar
+
+-- SIDEBAR FOR TABS
+local sideBar = Instance.new("Frame")
+sideBar.Size = UDim2.new(0, 110, 1, -55)
+sideBar.Position = UDim2.new(0, 0, 0, 30)
+sideBar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+sideBar.BorderColor3 = Color3.fromRGB(35, 35, 35)
+sideBar.BorderSizePixel = 1
+sideBar.Parent = main
+
+local sideLayout = Instance.new("UIListLayout")
+sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
+sideLayout.Parent = sideBar
+
+-- CONTENT AREA
+local contentArea = Instance.new("Frame")
+contentArea.Size = UDim2.new(1, -110, 1, -55)
+contentArea.Position = UDim2.new(0, 110, 0, 30)
+contentArea.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+contentArea.BorderColor3 = Color3.fromRGB(35, 35, 35)
+contentArea.BorderSizePixel = 1
+contentArea.Parent = main
+
+-- FOOTER / STATUS BAR
+local statusBar = Instance.new("Frame")
+statusBar.Size = UDim2.new(1, 0, 0, 25)
+statusBar.Position = UDim2.new(0, 0, 1, -25)
+statusBar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+statusBar.BorderColor3 = Color3.fromRGB(35, 35, 35)
+statusBar.BorderSizePixel = 1
+statusBar.Parent = main
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -10, 1, 0)
+statusLabel.Position = UDim2.new(0, 10, 0, 0)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "[STATUS]: IDLE"
+statusLabel.TextColor3 = Color3.fromRGB(140, 140, 140)
+statusLabel.Font = Enum.Font.Code
+statusLabel.TextSize = 11
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = statusBar
+
+-- TAB CREATION
+local tabs = {}
+local function createTab(name, index)
+	local tabBtn = Instance.new("TextButton")
+	tabBtn.Size = UDim2.new(1, 0, 0, 35)
+	tabBtn.BackgroundColor3 = (index == 1) and Color3.fromRGB(28, 28, 28) or Color3.fromRGB(18, 18, 18)
+	tabBtn.BorderColor3 = Color3.fromRGB(35, 35, 35)
+	tabBtn.BorderSizePixel = 1
+	tabBtn.Text = string.upper(name)
+	tabBtn.TextColor3 = (index == 1) and Color3.fromRGB(220, 220, 220) or Color3.fromRGB(110, 110, 110)
+	tabBtn.Font = Enum.Font.Code
+	tabBtn.TextSize = 11
+	tabBtn.Parent = sideBar
+
+	local tabContent = Instance.new("ScrollingFrame")
+	tabContent.Size = UDim2.new(1, -16, 1, -16)
+	tabContent.Position = UDim2.new(0, 8, 0, 8)
+	tabContent.BackgroundTransparency = 1
+	tabContent.BorderSizePixel = 0
+	tabContent.ScrollBarThickness = 2
+	tabContent.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 80)
+	tabContent.Visible = (index == 1)
+	tabContent.Parent = contentArea
+
+	local listLayout = Instance.new("UIListLayout")
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Padding = UDim.new(0, 8)
+	listLayout.Parent = tabContent
+
+	tabBtn.MouseButton1Click:Connect(function()
+		for _, t in ipairs(tabs) do
+			t.btn.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+			t.btn.TextColor3 = Color3.fromRGB(110, 110, 110)
+			t.content.Visible = false
+		end
+		tabBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+		tabBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+		tabContent.Visible = true
+	end)
+
+	local data = {btn = tabBtn, content = tabContent}
+	table.insert(tabs, data)
+	return tabContent
+end
+
+local tabReplicate = createTab("Replicate", 1)
+local tabStore = createTab("Map Search", 2)
+local tabFilters = createTab("Filters", 3)
+local tabAutoSave = createTab("Auto-Save", 4)
+local tabRotation = createTab("Rotation", 5)
+
+-- UI HELPERS
+local function addInput(parent, labelText, defaultText)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, 0, 0, 42)
+	container.BackgroundTransparency = 1
+	container.Parent = parent
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 0, 14)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = string.upper(labelText)
+	lbl.TextColor3 = Color3.fromRGB(130, 130, 130)
+	lbl.Font = Enum.Font.Code
+	lbl.TextSize = 10
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = container
+
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, 0, 0, 24)
+	box.Position = UDim2.new(0, 0, 0, 16)
+	box.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+	box.BorderColor3 = Color3.fromRGB(45, 45, 45)
+	box.BorderSizePixel = 1
+	box.Text = defaultText
+	box.TextColor3 = Color3.fromRGB(200, 200, 200)
+	box.Font = Enum.Font.Code
+	box.TextSize = 11
+	box.ClearTextOnFocus = false
+	box.Parent = container
+	return box
+end
+
+local function addButton(parent, text, color, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 26)
+	btn.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+	btn.BorderColor3 = color or Color3.fromRGB(55, 55, 55)
+	btn.BorderSizePixel = 1
+	btn.Text = string.upper("> " .. text)
+	btn.TextColor3 = color or Color3.fromRGB(180, 180, 180)
+	btn.Font = Enum.Font.Code
+	btn.TextSize = 11
+	btn.Parent = parent
+
+	btn.MouseButton1Click:Connect(callback)
+	return btn
+end
+
+-- TAB 1: REPLICATOR
+local assetBox = addInput(tabReplicate, "Asset ID", "15059364356")
+local modelNameBox = addInput(tabReplicate, "Target Model Name", "InsertedModel_15059364356")
+
+-- TAB 2: STORE MAP SEARCH
+local storeSearchContainer = Instance.new("Frame")
+storeSearchContainer.Size = UDim2.new(1, 0, 0, 42)
+storeSearchContainer.BackgroundTransparency = 1
+storeSearchContainer.Parent = tabStore
+
+local storeSearchLabel = Instance.new("TextLabel")
+storeSearchLabel.Size = UDim2.new(1, 0, 0, 14)
+storeSearchLabel.BackgroundTransparency = 1
+storeSearchLabel.Text = "SEARCH MAPS & BUILDINGS"
+storeSearchLabel.TextColor3 = Color3.fromRGB(130, 130, 130)
+storeSearchLabel.Font = Enum.Font.Code
+storeSearchLabel.TextSize = 10
+storeSearchLabel.TextXAlignment = Enum.TextXAlignment.Left
+storeSearchLabel.Parent = storeSearchContainer
+
+local storeSearchBox = Instance.new("TextBox")
+storeSearchBox.Size = UDim2.new(1, -30, 0, 24)
+storeSearchBox.Position = UDim2.new(0, 0, 0, 16)
+storeSearchBox.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+storeSearchBox.BorderColor3 = Color3.fromRGB(45, 45, 45)
+storeSearchBox.BorderSizePixel = 1
+storeSearchBox.Text = "house"
+storeSearchBox.TextColor3 = Color3.fromRGB(200, 200, 200)
+storeSearchBox.Font = Enum.Font.Code
+storeSearchBox.TextSize = 11
+storeSearchBox.ClearTextOnFocus = false
+storeSearchBox.Parent = storeSearchContainer
+
+local searchIconBtn = Instance.new("TextButton")
+searchIconBtn.Size = UDim2.new(0, 26, 0, 24)
+searchIconBtn.Position = UDim2.new(1, -26, 0, 16)
+searchIconBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+searchIconBtn.BorderColor3 = Color3.fromRGB(45, 45, 45)
+searchIconBtn.BorderSizePixel = 1
+searchIconBtn.Text = "🔍"
+searchIconBtn.TextColor3 = Color3.fromRGB(180, 180, 180)
+searchIconBtn.Font = Enum.Font.Code
+searchIconBtn.TextSize = 11
+searchIconBtn.Parent = storeSearchContainer
+
+local resultsFrame = Instance.new("Frame")
+resultsFrame.Size = UDim2.new(1, 0, 0, 160)
+resultsFrame.BackgroundTransparency = 1
+resultsFrame.Parent = tabStore
+
+local resultsLayout = Instance.new("UIListLayout")
+resultsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+resultsLayout.Padding = UDim.new(0, 4)
+resultsLayout.Parent = resultsFrame
+
+-- PAGINATION CONTAINER
+local pageBarLabel = Instance.new("TextLabel")
+pageBarLabel.Size = UDim2.new(1, 0, 0, 14)
+pageBarLabel.BackgroundTransparency = 1
+pageBarLabel.Text = "PAGES (SELECT 1 - 10):"
+pageBarLabel.TextColor3 = Color3.fromRGB(130, 130, 130)
+pageBarLabel.Font = Enum.Font.Code
+pageBarLabel.TextSize = 10
+pageBarLabel.TextXAlignment = Enum.TextXAlignment.Left
+pageBarLabel.Parent = tabStore
+
+local paginationScroll = Instance.new("ScrollingFrame")
+paginationScroll.Size = UDim2.new(1, 0, 0, 32)
+paginationScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+paginationScroll.BorderColor3 = Color3.fromRGB(35, 35, 35)
+paginationScroll.BorderSizePixel = 1
+paginationScroll.ScrollBarThickness = 3
+paginationScroll.ScrollBarImageColor3 = Color3.fromRGB(80, 80, 80)
+paginationScroll.CanvasSize = UDim2.new(0, 10 * 28 + 10, 0, 0)
+paginationScroll.Parent = tabStore
+
+local pageLayout = Instance.new("UIListLayout")
+pageLayout.FillDirection = Enum.FillDirection.Horizontal
+pageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+pageLayout.Padding = UDim.new(0, 4)
+pageLayout.Parent = paginationScroll
+
+-- POPULATE RESULTS
+local function populateResults(itemList)
+	for _, child in ipairs(resultsFrame:GetChildren()) do
+		if not child:IsA("UIListLayout") then child:Destroy() end
+	end
+
+	if not itemList or #itemList == 0 then
+		statusLabel.Text = "[STATUS]: NO MODELS FOUND"
+		return
+	end
+
+	local displayedCount = 0
+	for _, item in ipairs(itemList) do
+		local id = item.id or item.Id or item.assetId or item.AssetId
+		local name = item.name or item.Name or item.title or item.Title or ("Model " .. tostring(id))
+
+		if id then
+			local idStr = tostring(id)
+			local nameStr = tostring(name)
+			displayedCount = displayedCount + 1
+
+			local itemBtn = Instance.new("TextButton")
+			itemBtn.Size = UDim2.new(1, 0, 0, 24)
+			itemBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+			itemBtn.BorderColor3 = Color3.fromRGB(40, 40, 40)
+			itemBtn.BorderSizePixel = 1
+			itemBtn.Text = "  [LOAD MODEL] " .. nameStr .. " (" .. idStr .. ")"
+			itemBtn.TextColor3 = Color3.fromRGB(180, 180, 180)
+			itemBtn.Font = Enum.Font.Code
+			itemBtn.TextSize = 10
+			itemBtn.TextXAlignment = Enum.TextXAlignment.Left
+			itemBtn.Parent = resultsFrame
+
+			itemBtn.MouseButton1Click:Connect(function()
+				assetBox.Text = idStr
+				modelNameBox.Text = "InsertedModel_" .. idStr
+				statusLabel.Text = "[STATUS]: LOADED " .. string.upper(nameStr)
+			end)
+		end
+	end
+
+	statusLabel.Text = "[STATUS]: PAGE " .. currentPage .. " | DISPLAYING " .. displayedCount .. " MODELS"
+end
+
+-- SEARCH ENGINE
+local forwardSearchStore = nil
+
+local function searchCreatorStore(query, page)
+	if not httpRequest then
+		statusLabel.Text = "[ERROR]: HTTP REQUEST NOT SUPPORTED ON EXECUTOR"
+		return
+	end
+
+	currentPage = page or 1
+	currentSearchQuery = query
+	statusLabel.Text = "[STATUS]: SEARCHING MODELS (PAGE " .. currentPage .. ")..."
+
+	task.spawn(function()
+		local headers = {
+			["User-Agent"] = "Roblox/WinInet",
+			["Accept"] = "application/json"
+		}
+
+		local limit = 12
+		local url = "https://catalog.roblox.com/v1/search/items/details?Category=6&Keyword=" 
+			.. HttpService:UrlEncode(query) 
+			.. "&Limit=" .. limit 
+
+		local success, response = pcall(function()
+			return httpRequest({ Url = url, Method = "GET", Headers = headers })
+		end)
+
+		if success and response and response.StatusCode == 200 then
+			local decodeSuccess, decoded = pcall(function()
+				return HttpService:JSONDecode(response.Body)
+			end)
+
+			if decodeSuccess and decoded and decoded.data and #decoded.data > 0 then
+				populateResults(decoded.data)
+				return
+			end
+		end
+
+		statusLabel.Text = "[ERROR]: NO MODELS FOUND FOR '" .. query .. "'"
+	end)
+end
+
+forwardSearchStore = searchCreatorStore
+
+searchIconBtn.MouseButton1Click:Connect(function()
+	currentPage = 1
+	renderPageButtons()
+	forwardSearchStore(storeSearchBox.Text, 1)
+end)
+
+storeSearchBox.FocusLost:Connect(function(enterPressed)
+	if enterPressed then
+		currentPage = 1
+		renderPageButtons()
+		forwardSearchStore(storeSearchBox.Text, 1)
+	end
+end)
+
+function renderPageButtons()
+	for _, child in ipairs(paginationScroll:GetChildren()) do
+		if not child:IsA("UIListLayout") then child:Destroy() end
+	end
+
+	for i = 1, 10 do
+		local pageBtn = Instance.new("TextButton")
+		pageBtn.Size = UDim2.new(0, 24, 0, 24)
+		pageBtn.BackgroundColor3 = (i == currentPage) and Color3.fromRGB(45, 45, 45) or Color3.fromRGB(22, 22, 22)
+		pageBtn.BorderColor3 = Color3.fromRGB(40, 40, 40)
+		pageBtn.BorderSizePixel = 1
+		pageBtn.Text = tostring(i)
+		pageBtn.TextColor3 = (i == currentPage) and Color3.fromRGB(240, 240, 240) or Color3.fromRGB(140, 140, 140)
+		pageBtn.Font = Enum.Font.Code
+		pageBtn.TextSize = 10
+		pageBtn.Parent = paginationScroll
+
+		pageBtn.MouseButton1Click:Connect(function()
+			currentPage = i
+			renderPageButtons()
+			forwardSearchStore(storeSearchBox.Text, currentPage)
+		end)
+	end
+end
+
+renderPageButtons()
+
+-- TAB 3: FILTERS
+local blacklistText = addInput(tabFilters, "Blacklisted Names (Comma Separated)", "Barrel, bench, board, bush, cardboard box, ceiling light, chair, crate, hanukkahCandles, lifting cart, lightfixture, Micstand, plant, pottedbush, InvisibleBarrier")
+local offsetBox = addInput(tabFilters, "Offset Vector (X, Y, Z)", "500, 500, 0")
+
+-- TAB 4: AUTO SAVE
+local slotBox = addInput(tabAutoSave, "Target Save Slot", "Slot10")
+
+local autoSaveBtn
+autoSaveBtn = addButton(tabAutoSave, "Auto-Save: OFF", Color3.fromRGB(140, 140, 140), function()
+	autoSaveActive = not autoSaveActive
+	if autoSaveActive then
+		autoSaveBtn.Text = "> AUTO-SAVE: ON"
+		autoSaveBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+		statusLabel.Text = "[STATUS]: AUTO-SAVE ACTIVE"
+	else
+		autoSaveBtn.Text = "> AUTO-SAVE: OFF"
+		autoSaveBtn.TextColor3 = Color3.fromRGB(140, 140, 140)
+		statusLabel.Text = "[STATUS]: AUTO-SAVE DISABLED"
+	end
+end)
+
+addButton(tabAutoSave, "Manual Save Build", Color3.fromRGB(180, 180, 180), function()
+	pcall(function()
+		SaveBuildRemote:InvokeServer(slotBox.Text)
+	end)
+	statusLabel.Text = "[STATUS]: SAVED TO " .. string.upper(slotBox.Text)
+end)
+
+-- TAB 5: ROTATION
+local rotationBox = addInput(tabRotation, "Model Angle Offsets (X, Y, Z Degrees)", "0, 0, 0")
+
+local function parseRotation()
+	local angles = {}
+	for num in string.gmatch(rotationBox.Text, "[%-%d%.]+") do
+		table.insert(angles, tonumber(num))
+	end
+	if #angles >= 3 then
+		return CFrame.Angles(math.rad(angles[1]), math.rad(angles[2]), math.rad(angles[3]))
+	end
+	return CFrame.Angles(0, 0, 0)
+end
+
+addButton(tabRotation, "Apply Model Angle / Orientation", Color3.fromRGB(180, 180, 180), function()
+	currentRotationCF = parseRotation()
+	statusLabel.Text = "[STATUS]: ROTATION SET TO (" .. rotationBox.Text .. ")"
+end)
+
+-- UTILITIES
+local function parseBlacklist()
+	local list = {}
+	for name in string.gmatch(blacklistText.Text, "[^,]+") do
+		local cleanName = string.lower(string.match(name, "^%s*(.-)%s*$"))
+		if cleanName ~= "" then
+			table.insert(list, cleanName)
+		end
+	end
+	return list
+end
+
+local function parseOffset()
+	local coords = {}
+	for num in string.gmatch(offsetBox.Text, "[%-%d%.]+") do
+		table.insert(coords, tonumber(num))
+	end
+	if #coords >= 3 then
+		return Vector3.new(coords[1], coords[2], coords[3])
+	end
+	return Vector3.new(500, 500, 0)
+end
+
+-- CORE HELPER TO SPAWN AND CONFIGURE A BLOCK
+local function spawnBlock(template, cframe, brickColor, material, size, imageId, soundId, playbackSpeed, isLight, lightColor, lightRange, lightBrightness, customColor, buildModel, baseSpawnCFrame, gridIndex)
+	local gridX = ((gridIndex - 1) % 15) * 6
+	local gridZ = math.floor((gridIndex - 1) / 15) * 6
+	local clearanceCFrame = baseSpawnCFrame * CFrame.new(gridX, 0, gridZ)
+
+	local spawnedInstance = nil
+	local connection = buildModel.ChildAdded:Connect(function(child)
+		spawnedInstance = child
+	end)
+
+	pcall(function()
+		PlaceBlockRemote:InvokeServer(
+			template,
+			clearanceCFrame,
+			brickColor,
+			material
+		)
+	end)
+
+	local t = 0
+	while not spawnedInstance and t < 0.25 do
+		task.wait(0.005)
+		t = t + 0.005
+	end
+
+	if connection then connection:Disconnect() end
+	local newBlock = spawnedInstance or (buildModel:GetChildren())[#buildModel:GetChildren()]
+
+	if newBlock then
+		pcall(function()
+			CommitMoveRemote:InvokeServer(newBlock, cframe)
+		end)
+
+		local colorPart = newBlock:FindFirstChild("ColorPart") or newBlock
+		pcall(function()
+			CommitResizeRemote:InvokeServer(newBlock, {
+				colorPart,
+				cframe,
+				size
+			})
+		end)
+
+		if UpdateBlockSettingsRemote then
+			local settingsDict = {}
+
+			if isLight then
+				settingsDict["R"] = math.clamp(math.floor(lightColor.R * 255), 0, 255)
+				settingsDict["G"] = math.clamp(math.floor(lightColor.G * 255), 0, 255)
+				settingsDict["B"] = math.clamp(math.floor(lightColor.B * 255), 0, 255)
+				settingsDict["Range"] = math.clamp(math.floor(lightRange), 1, 60)
+				settingsDict["Brightness"] = math.clamp(math.floor(lightBrightness), 1, 30)
+			end
+
+			if imageId then
+				settingsDict["Image Id"] = imageId
+			end
+
+			if soundId then
+				settingsDict["Sound Id"] = soundId
+				settingsDict["PlaybackSpeed"] = playbackSpeed
+			end
+
+			if next(settingsDict) ~= nil then
+				pcall(function()
+					UpdateBlockSettingsRemote:InvokeServer(newBlock, settingsDict)
+				end)
+			end
+		end
+
+		if colorPart and colorPart:IsA("BasePart") and customColor then
+			pcall(function() colorPart.Color = customColor end)
+		end
+	end
+
+	return newBlock
+end
+
+-- PLACE BLOCK PROCESSOR (DUAL-LAYER SYSTEM)
+local function placeSingleBlock(index, data, offsetVector, baseSpawnCFrame, buildModel)
+	local finalCF = CFrame.new(data.cframe.Position + offsetVector) * currentRotationCF * (data.cframe - data.cframe.Position)
+
+	-- STEP 1: PLACE BASE SHADOW BLOCK
+	spawnBlock(
+		data.template,
+		finalCF,
+		data.brickColor,
+		data.material,
+		data.size,
+		nil,
+		data.soundId,
+		data.playbackSpeed,
+		false,
+		nil, nil, nil,
+		data.color,
+		buildModel,
+		baseSpawnCFrame,
+		index
+	)
+
+	-- STEP 2: PLACE OVERLAY TEXTURE BLOCK (Slightly oversized by 0.05 studs, NO color/RGB tint passed)
+	if data.imageId and TextureBlockTemplate then
+		task.wait(0.02)
+		local slightlyLargerSize = data.size + Vector3.new(0.05, 0.05, 0.05)
+		spawnBlock(
+			TextureBlockTemplate,
+			finalCF,
+			BrickColor.new("Institutional white"),
+			Enum.Material.SmoothPlastic,
+			slightlyLargerSize,
+			data.imageId,
+			nil,
+			1,
+			false,
+			nil, nil, nil,
+			nil, -- Color explicitly omitted to prevent texture updating issues
+			buildModel,
+			baseSpawnCFrame,
+			index + 50000
+		)
+	end
+
+	-- STEP 3: PLACE INVISIBLE LIGHT OVERLAY (IF LIGHT SOURCE WAS DETECTED)
+	if data.isLight and InvisibleLightTemplate then
+		task.wait(0.02)
+		spawnBlock(
+			InvisibleLightTemplate,
+			finalCF,
+			BrickColor.new("White"),
+			Enum.Material.Plastic,
+			data.size,
+			nil, nil, nil,
+			true,
+			data.lightColor,
+			data.lightRange,
+			data.lightBrightness,
+			data.lightColor,
+			buildModel,
+			baseSpawnCFrame,
+			index + 100000
+		)
+	end
+end
+
+-- WORKSPACE SCANNER
+local function scanWorkspaceModel()
+	local target = Workspace:FindFirstChild(modelNameBox.Text, true)
+	if not target then return nil end
+
+	local blacklist = parseBlacklist()
+	local partsCatalog = {}
+	local descendants = target:IsA("BasePart") and {target} or target:GetDescendants()
+
+	for _, descendant in ipairs(descendants) do
+		if descendant:IsA("BasePart") then
+			local isBlacklisted = false
+			local checkInstance = descendant
+
+			while checkInstance and checkInstance ~= Workspace do
+				local lowerName = string.lower(checkInstance.Name)
+				for _, skipName in ipairs(blacklist) do
+					if string.find(lowerName, skipName, 1, true) then
+						isBlacklisted = true
+						break
+					end
+				end
+				if isBlacklisted then break end
+				checkInstance = checkInstance.Parent
+			end
+
+			if not isBlacklisted then
+				local imageId = nil
+				local soundId = nil
+				local playbackSpeed = 1
+				local isLight = false
+				local lightColor = Color3.fromRGB(255, 255, 255)
+				local lightRange = 12
+				local lightBrightness = 1
+
+				-- SCAN FOR TEXTURE/DECAL ON PART OR DESCENDANTS
+				local decal = descendant:FindFirstChildOfClass("Decal") or descendant:FindFirstChildOfClass("Texture")
+				if not decal then
+					decal = descendant:FindFirstChildWhichIsA("Decal", true) or descendant:FindFirstChildWhichIsA("Texture", true)
+				end
+
+				if decal and decal.Texture ~= "" then
+					imageId = tonumber(string.match(decal.Texture, "%d+"))
+				end
+
+				local finalColor = descendant.Color
+
+				-- SCAN FOR SOUND
+				local sound = descendant:FindFirstChildOfClass("Sound") or descendant:FindFirstChildWhichIsA("Sound", true)
+				if sound and sound.SoundId ~= "" then
+					soundId = tonumber(string.match(sound.SoundId, "%d+"))
+					playbackSpeed = sound.PlaybackSpeed or 1
+				end
+
+				-- AUTO SEARCH FOR LIGHTS (PARTS & ATTACHMENTS)
+				local light = findLightInPartOrAttachments(descendant)
+				if light then
+					isLight = true
+					lightColor = light.Color
+					lightRange = light.Range
+					lightBrightness = light.Brightness
+				end
+
+				table.insert(partsCatalog, {
+					cframe = descendant.CFrame,
+					size = descendant.Size,
+					color = finalColor,
+					brickColor = BrickColor.new(finalColor),
+					material = descendant.Material,
+					template = getTemplateForPart(descendant),
+					imageId = imageId,
+					soundId = soundId,
+					playbackSpeed = playbackSpeed,
+					isLight = isLight,
+					lightColor = lightColor,
+					lightRange = lightRange,
+					lightBrightness = lightBrightness
+				})
+			end
+		end
+	end
+	return partsCatalog
+end
+
+-- REPLICATION CONTROLLER
+local function replicateTarget(resumeOnly)
+	local catalog = scanWorkspaceModel()
+
+	if not catalog or #catalog == 0 then
+		statusLabel.Text = "[ERROR]: TARGET NOT FOUND OR EMPTY"
+		return
+	end
+
+	local offsetVector = parseOffset()
+	local buildModel = Workspace:FindFirstChild("BuildModel") or Workspace
+
+	local existingPositions = {}
+	if resumeOnly then
+		statusLabel.Text = "[STATUS]: SCANNING EXISTING MAP..."
+		for _, child in ipairs(buildModel:GetChildren()) do
+			local part = child:FindFirstChild("ColorPart") or child
+			if part and part:IsA("BasePart") then
+				local pos = part.Position
+				local key = math.floor(pos.X + 0.5) .. "_" .. math.floor(pos.Y + 0.5) .. "_" .. math.floor(pos.Z + 0.5)
+				existingPositions[key] = true
+			end
+		end
+	end
+
+	local missingCatalog = {}
+	for _, data in ipairs(catalog) do
+		local targetCFrame = CFrame.new(data.cframe.Position + offsetVector) * currentRotationCF * (data.cframe - data.cframe.Position)
+		local pos = targetCFrame.Position
+		local key = math.floor(pos.X + 0.5) .. "_" .. math.floor(pos.Y + 0.5) .. "_" .. math.floor(pos.Z + 0.5)
+
+		if not resumeOnly or not existingPositions[key] then
+			table.insert(missingCatalog, data)
+		end
+	end
+
+	if #missingCatalog == 0 then
+		statusLabel.Text = "[STATUS]: ALL PARTS ALREADY PLACED"
+		return
+	end
+
+	local baseSpawnCFrame = CFrame.new(0, 100, 0)
+	if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+		baseSpawnCFrame = LocalPlayer.Character.HumanoidRootPart.CFrame * CFrame.new(0, 100, 0)
+	end
+
+	local total = #missingCatalog
+	for index, data in ipairs(missingCatalog) do
+		if not isRunning then break end
+		statusLabel.Text = "[STATUS]: PLACING " .. index .. " / " .. total
+		placeSingleBlock(index, data, offsetVector, baseSpawnCFrame, buildModel)
+		task.wait(0.05)
+	end
+
+	if isRunning then statusLabel.Text = "[STATUS]: FINISHED REPLICATING" end
+end
+
+-- BUTTON REGISTRATIONS
+addButton(tabReplicate, "Insert Model", Color3.fromRGB(160, 160, 160), function()
+	local assetId = tonumber(assetBox.Text)
+	if not assetId then return end
+	local objects = game:GetObjects("rbxassetid://" .. tostring(assetId))
+	if objects and #objects > 0 then
+		local container = Instance.new("Model")
+		container.Name = "InsertedModel_" .. tostring(assetId)
+		for _, obj in ipairs(objects) do obj.Parent = container end
+		container.Parent = Workspace
+		modelNameBox.Text = container.Name
+	end
+end)
+
+addButton(tabReplicate, "Replicate Full Map", Color3.fromRGB(200, 200, 200), function()
+	if isRunning then return end
+	isRunning = true
+	task.spawn(function()
+		replicateTarget(false)
+		isRunning = false
+	end)
+end)
+
+addButton(tabReplicate, "Resume / Place Missing", Color3.fromRGB(160, 160, 160), function()
+	if isRunning then return end
+	isRunning = true
+	task.spawn(function()
+		replicateTarget(true)
+		isRunning = false
+	end)
+end)
+
+addButton(tabReplicate, "Stop Execution", Color3.fromRGB(120, 120, 120), function()
+	isRunning = false
+	statusLabel.Text = "[STATUS]: STOPPED"
+end)
